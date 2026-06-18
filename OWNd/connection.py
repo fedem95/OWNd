@@ -1,72 +1,68 @@
-""" This module handles TCP connections to the OpenWebNet gateway """
+"""This module handles TCP connections to the OpenWebNet gateway"""
+
+from __future__ import annotations
 
 import asyncio
-import hmac
+import contextlib
 import hashlib
-import string
-import random
+import hmac
 import logging
-from typing import Union
+import secrets
+import string
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 from .discovery import find_gateways, get_gateway, get_port
 from .message import OWNMessage, OWNSignaling
 
+# The gateway is expected to answer promptly during session negotiation and
+# when acknowledging a command. These reads are bounded so a stalled or
+# misbehaving gateway can never block the asyncio event loop indefinitely.
+# NOTE: the *event* listener read (`OWNEventSession.get_next`) is intentionally
+# NOT bounded: long periods of silence on the bus are normal and must not
+# trigger spurious reconnections.
+NEGOTIATION_TIMEOUT = 10
+COMMAND_TIMEOUT = 10
+# Bound the TCP connect itself, so a black-holed host (SYN accepted, never
+# completed) cannot hang the event loop for the OS-default TCP timeout.
+CONNECT_TIMEOUT = 10
+MAX_CONNECT_ATTEMPTS = 5
+# Active keepalive: a harmless "gateway time" request that the MH201 answers.
+# Sent periodically on the COMMAND session; a failure forces a reconnect.
+KEEPALIVE_FRAME = "*#13**0##"
+KEEPALIVE_INTERVAL = 900  # 15 minutes
+# Passive watchdog on the EVENT session: if no frame arrives for this long the
+# connection is presumed dead and re-established. Must be set ABOVE the gateway's
+# own session lifetime (observed ~58 min on MH201) so it never false-positives
+# during normal operation; it only catches a truly silent death (power loss,
+# cable pulled) when no clean FIN/RST is received.
+EVENT_INACTIVITY_TIMEOUT = 3900  # 65 minutes
+# Negotiation failures that will never succeed on a retry: don't loop on them.
+_FATAL_NEGOTIATION_ERRORS = frozenset(
+    {"password_required", "password_error", "negociation_error"}
+)
+
 
 class OWNGateway:
     def __init__(self, discovery_info: dict):
         # Attributes potentially provided by user
-        self.address = (
-            discovery_info["address"] if "address" in discovery_info else None
-        )
-        self._password = (
-            discovery_info["password"] if "password" in discovery_info else None
-        )
+        self.address = discovery_info.get("address")
+        self._password = discovery_info.get("password")
         # Attributes retrieved from SSDP discovery
-        self.ssdp_location = (
-            discovery_info["ssdp_location"]
-            if "ssdp_location" in discovery_info
-            else None
-        )
-        self.ssdp_st = (
-            discovery_info["ssdp_st"] if "ssdp_st" in discovery_info else None
-        )
+        self.ssdp_location = discovery_info.get("ssdp_location")
+        self.ssdp_st = discovery_info.get("ssdp_st")
         # Attributes retrieved from UPnP device description
-        self.device_type = (
-            discovery_info["deviceType"] if "deviceType" in discovery_info else None
-        )
-        self.friendly_name = (
-            discovery_info["friendlyName"] if "friendlyName" in discovery_info else None
-        )
-        self.manufacturer = (
-            discovery_info["manufacturer"]
-            if "manufacturer" in discovery_info
-            else "BTicino S.p.A."
-        )
-        self.manufacturer_url = (
-            discovery_info["manufacturerURL"]
-            if "manufacturerURL" in discovery_info
-            else None
-        )
-        self.model_name = (
-            discovery_info["modelName"]
-            if "modelName" in discovery_info
-            else "Unknown model"
-        )
-        self.model_number = (
-            discovery_info["modelNumber"] if "modelNumber" in discovery_info else None
-        )
-        # self.presentationURL = (
-        #     discovery_info["presentationURL"]
-        #     if "presentationURL" in discovery_info
-        #     else None
-        # )
-        self.serial_number = (
-            discovery_info["serialNumber"] if "serialNumber" in discovery_info else None
-        )
-        self.udn = discovery_info["UDN"] if "UDN" in discovery_info else None
+        self.device_type = discovery_info.get("deviceType")
+        self.friendly_name = discovery_info.get("friendlyName")
+        self.manufacturer = discovery_info.get("manufacturer", "BTicino S.p.A.")
+        self.manufacturer_url = discovery_info.get("manufacturerURL")
+        self.model_name = discovery_info.get("modelName", "Unknown model")
+        self.model_number = discovery_info.get("modelNumber")
+        # self.presentationURL = discovery_info.get("presentationURL")
+        self.serial_number = discovery_info.get("serialNumber")
+        self.udn = discovery_info.get("UDN")
         # Attributes retrieved from SOAP service control
-        self.port = discovery_info["port"] if "port" in discovery_info else None
+        self.port = discovery_info.get("port")
 
         self._log_id = f"[{self.model_name} gateway - {self.host}]"
 
@@ -115,21 +111,23 @@ class OWNGateway:
         return self._log_id
 
     @log_id.setter
-    def log_id(self, id: str) -> None:
-        self._log_id = id
+    def log_id(self, value: str) -> None:
+        self._log_id = value
 
     @classmethod
     async def get_first_available_gateway(cls, password: str = None):
         local_gateways = await find_gateways()
+        if not local_gateways:
+            return None
         local_gateways[0]["password"] = password
         return cls(local_gateways[0])
 
     @classmethod
     async def find_from_address(cls, address: str):
         if address is not None:
-            return cls(await get_gateway(address))
-        else:
-            return await cls.get_first_available_gateway()
+            gateway = await get_gateway(address)
+            return cls(gateway) if gateway is not None else None
+        return await cls.get_first_available_gateway()
 
     @classmethod
     async def build_from_discovery_info(cls, discovery_info: dict):
@@ -152,9 +150,7 @@ class OWNGateway:
                 return await cls.find_from_address(discovery_info["address"])
             else:
                 return await cls.get_first_available_gateway(
-                    password=discovery_info["password"]
-                    if "password" in discovery_info
-                    else None
+                    password=discovery_info.get("password")
                 )
 
         return cls(discovery_info)
@@ -163,31 +159,68 @@ class OWNGateway:
 class OWNSession:
     """Connection to OpenWebNet gateway"""
 
-    SEPARATOR = "##".encode()
+    SEPARATOR = b"##"
 
     def __init__(
         self,
-        gateway: OWNGateway = None,
+        gateway: OWNGateway | None = None,
         connection_type: str = "test",
-        logger: logging.Logger = None,
+        logger: logging.Logger | None = None,
+        on_state_change: Callable[[bool], None] | None = None,
     ):
         """Initialize the class
         Arguments:
         gateway: OpenWebNet gateway instance
         connection_type: used when logging to identify this session
         logger: instance of logging
+        on_state_change: optional callback invoked with True/False whenever the
+            connection comes up / goes down. Lets a consumer (e.g. the Home
+            Assistant integration) flip entity availability instantly instead of
+            waiting for the next keepalive.
         """
 
         self._gateway = gateway
         self._type = connection_type.lower()
         self._logger = logger
+        self._on_state_change = on_state_change
+        self._connected = False
 
-        # annotations for stream reader/writer:
-        self._stream_reader: asyncio.StreamReader
-        self._stream_writer: asyncio.StreamWriter
-        # init them to None:
-        self._stream_reader = None
-        self._stream_writer = None
+        # Stream reader/writer, initialised on connect():
+        self._stream_reader: asyncio.StreamReader | None = None
+        self._stream_writer: asyncio.StreamWriter | None = None
+
+    @property
+    def is_connected(self) -> bool:
+        """True once a session has been negotiated and not since lost."""
+        return self._connected
+
+    def _set_connected(self, value: bool) -> None:
+        """Update connection state and notify the consumer on transitions only."""
+        if value == self._connected:
+            return
+        self._connected = value
+        if self._on_state_change is not None:
+            try:
+                self._on_state_change(value)
+            except Exception:  # noqa: BLE001 - consumer callback must not break us
+                self._logger.exception(
+                    "%s on_state_change callback raised.", self._gateway.log_id
+                )
+
+    async def _read_frame(self, timeout: float | None = None) -> str:  # noqa: ASYNC109
+        """Read one OWN frame (terminated by SEPARATOR) and return it decoded.
+
+        When ``timeout`` is provided, an ``asyncio.TimeoutError`` is raised if the
+        gateway stays silent for longer than that, so negotiation and command
+        acknowledgements can never block the event loop indefinitely. The event
+        listener passes ``None`` on purpose, as bus silence is expected there.
+        """
+        reader = self._stream_reader.readuntil(OWNSession.SEPARATOR)
+        if timeout is not None:
+            raw_response = await asyncio.wait_for(reader, timeout=timeout)
+        else:
+            raw_response = await reader
+        return raw_response.decode()
 
     @property
     def gateway(self) -> OWNGateway:
@@ -196,14 +229,6 @@ class OWNSession:
     @gateway.setter
     def gateway(self, gateway: OWNGateway) -> None:
         self._gateway = gateway
-
-    # password is a property inside OWNGateway... right?
-    #@property
-    #def password(self) -> str:
-    #    return str(self._password)
-    #@password.setter
-    #def password(self, password: str) -> None:
-    #    self._password = password
 
     @property
     def logger(self) -> logging.Logger:
@@ -237,7 +262,7 @@ class OWNSession:
                         "%s Test session connection still refused after 3 attempts.",
                         self._gateway.log_id,
                     )
-                    return None
+                    return {"Success": False, "Message": "connection_error"}
                 (
                     self._stream_reader,
                     self._stream_writer,
@@ -245,10 +270,11 @@ class OWNSession:
                     self._gateway.address, self._gateway.port
                 )
                 break
-            except ConnectionRefusedError:
+            except (ConnectionRefusedError, TimeoutError, OSError) as error:
                 self._logger.warning(
-                    "%s Test session connection refused, retrying in %ss.",
+                    "%s Test session connection failed (%s), retrying in %ss.",
                     self._gateway.log_id,
+                    error,
                     retry_timer,
                 )
                 await asyncio.sleep(retry_timer)
@@ -259,15 +285,24 @@ class OWNSession:
             result = await self._negotiate()
             await self.close()
         except ConnectionResetError:
-            error = True
-            error_message = "password_retry"
             self._logger.error(
                 "%s Negotiation reset while opening %s session. Wait 60 seconds before retrying.",
                 self._gateway.log_id,
                 self._type,
             )
-
-            return {"Success": not error, "Message": error_message}
+            return {"Success": False, "Message": "password_retry"}
+        except (asyncio.IncompleteReadError, EOFError, TimeoutError, OSError) as error:
+            # The gateway accepted the TCP connection but closed it (or timed
+            # out) during negotiation: typical right after a reboot/power-cycle
+            # when it is not ready yet. Report a clean transient failure instead
+            # of letting the exception propagate and crash the caller's setup.
+            self._logger.warning(
+                "%s Negotiation failed while opening %s session (%s).",
+                self._gateway.log_id,
+                self._type,
+                error,
+            )
+            return {"Success": False, "Message": "connection_error"}
 
         return result
 
@@ -275,50 +310,92 @@ class OWNSession:
         self._logger.debug("%s Opening %s session.", self._gateway.log_id, self._type)
 
         retry_count = 0
-        retry_timer = 1
 
         while True:
             try:
-                if retry_count > 4:
-                    self._logger.error(
-                        "%s %s session connection still refused after 5 attempts.",
-                        self._gateway.log_id,
-                        self._type.capitalize(),
-                    )
-                    return None
+                # Bound the connect: open_connection has no timeout of its own.
                 (
                     self._stream_reader,
                     self._stream_writer,
-                ) = await asyncio.open_connection(
-                    self._gateway.address, self._gateway.port
+                ) = await asyncio.wait_for(
+                    asyncio.open_connection(self._gateway.address, self._gateway.port),
+                    timeout=CONNECT_TIMEOUT,
                 )
-                return await self._negotiate()
-            except (ConnectionRefusedError, asyncio.IncompleteReadError):
-                self._logger.warning(
-                    "%s %s session connection refused, retrying in %ss.",
-                    self._gateway.log_id,
-                    self._type.capitalize(),
-                    retry_timer,
-                )
-                await asyncio.sleep(retry_timer)
-                retry_count += 1
-                retry_timer = retry_count * 2
+                result = await self._negotiate()
+                if result.get("Success"):
+                    self._set_connected(True)
+                    return result
+                # Negotiation completed but was rejected.
+                if result.get("Message") in _FATAL_NEGOTIATION_ERRORS:
+                    self._logger.error(
+                        "%s %s session negotiation failed (%s); giving up.",
+                        self._gateway.log_id,
+                        self._type.capitalize(),
+                        result.get("Message"),
+                    )
+                    self._set_connected(False)
+                    return result
+                reason = f"negotiation failed ({result.get('Message')})"
+                wait = max(1, retry_count * 2)
             except ConnectionResetError:
-                self._logger.warning(
-                    "%s %s session connection reset, retrying in 60s.",
+                reason, wait = "connection reset", 60
+            except (ConnectionRefusedError, asyncio.IncompleteReadError):
+                reason, wait = "connection refused", max(1, retry_count * 2)
+            except TimeoutError:
+                reason, wait = (
+                    f"connect timed out ({CONNECT_TIMEOUT}s)",
+                    max(1, retry_count * 2),
+                )
+            except OSError as error:
+                # Host unreachable, no route, DNS failure, etc.
+                reason, wait = f"network error ({error})", max(1, retry_count * 2)
+
+            retry_count += 1
+            if retry_count >= MAX_CONNECT_ATTEMPTS:
+                self._logger.error(
+                    "%s %s session could not be established after %d attempts; giving up.",
                     self._gateway.log_id,
                     self._type.capitalize(),
+                    MAX_CONNECT_ATTEMPTS,
                 )
-                await asyncio.sleep(60)
-                retry_count += 1
+                self._set_connected(False)
+                return None
+            self._logger.warning(
+                "%s %s session: %s. Retrying in %ss (attempt %d/%d).",
+                self._gateway.log_id,
+                self._type.capitalize(),
+                reason,
+                wait,
+                retry_count,
+                MAX_CONNECT_ATTEMPTS,
+            )
+            await asyncio.sleep(wait)
+
+    async def _reconnect(self) -> dict | None:
+        """Tear down a (likely broken) connection and open a fresh one.
+
+        Connection state is intentionally NOT flipped to False here: a routine
+        reconnect (the gateway recycles the session ~hourly) recovers in well
+        under a second and must not flap entity availability. State only goes
+        False when connect() definitively gives up (see below).
+        """
+        # Closing a broken socket may itself fail; we don't care here.
+        with contextlib.suppress(Exception):
+            await self.close()
+        return await self.connect()
 
     async def close(self) -> None:
-        """Closes the connection to the OpenWebNet gateway"""
+        """Closes the connection to the OpenWebNet gateway."""
 
-        # this method may be invoked on an empty instance of OWNSession, so be robust against Nones:
+        # May be invoked on an empty instance, or on an already-broken socket:
+        # be robust against Nones and against wait_closed() re-raising.
         if self._stream_writer is not None:
             self._stream_writer.close()
-            await self._stream_writer.wait_closed()
+            # The peer may already be gone; we only need it marked closed.
+            with contextlib.suppress(OSError, asyncio.IncompleteReadError):
+                await self._stream_writer.wait_closed()
+        self._stream_reader = None
+        self._stream_writer = None
         if self._gateway is not None:
             self._logger.debug(
                 "%s %s session closed.", self._gateway.log_id, self._type.capitalize()
@@ -333,85 +410,86 @@ class OWNSession:
             "%s Negotiating %s session.", self._gateway.log_id, self._type
         )
 
-        self._stream_writer.write(f"*99*{type_id}##".encode())
-        await self._stream_writer.drain()
+        try:
+            self._stream_writer.write(f"*99*{type_id}##".encode())
+            await self._stream_writer.drain()
 
-        raw_response = await self._stream_reader.readuntil(OWNSession.SEPARATOR)
-        resulting_message = OWNSignaling(raw_response.decode())
-        # self._logger.debug("%s Reply: `%s`", self._gateway.log_id, resulting_message)
+            resulting_message = OWNSignaling(
+                await self._read_frame(NEGOTIATION_TIMEOUT)
+            )
 
-        if resulting_message.is_nack():
-            self._logger.error(
-                "%s Error while opening %s session.", self._gateway.log_id, self._type
-            )
-            error = True
-            error_message = "connection_refused"
-
-        raw_response = await self._stream_reader.readuntil(OWNSession.SEPARATOR)
-        resulting_message = OWNSignaling(raw_response.decode())
-        if resulting_message.is_nack():
-            error = True
-            error_message = "negotiation_refused"
-            self._logger.debug(
-                "%s Reply: `%s`", self._gateway.log_id, resulting_message
-            )
-            self._logger.error(
-                "%s Error while opening %s session.", self._gateway.log_id, self._type
-            )
-        elif resulting_message.is_sha():
-            self._logger.debug(
-                "%s Received SHA challenge: `%s`",
-                self._gateway.log_id,
-                resulting_message,
-            )
-            if self._gateway.password is None:
+            if resulting_message.is_nack():
+                self._logger.error(
+                    "%s Error while opening %s session.",
+                    self._gateway.log_id,
+                    self._type,
+                )
                 error = True
-                error_message = "password_required"
-                self._logger.warning(
-                    "%s Connection requires a password but none was provided.",
-                    self._gateway.log_id,
-                )
-                self._stream_writer.write("*#*0##".encode())
-                await self._stream_writer.drain()
-            else:
-                method = "sha"
-                if resulting_message.is_sha_1():
-                    # self._logger.debug("%s Detected SHA-1 method.", self._gateway.log_id)
-                    method = "sha1"
-                elif resulting_message.is_sha_256():
-                    # self._logger.debug("%s Detected SHA-256 method.", self._gateway.log_id)
-                    method = "sha256"
+                error_message = "connection_refused"
+
+            resulting_message = OWNSignaling(
+                await self._read_frame(NEGOTIATION_TIMEOUT)
+            )
+            if resulting_message.is_nack():
+                error = True
+                error_message = "negotiation_refused"
                 self._logger.debug(
-                    "%s Accepting %s challenge, initiating handshake.",
-                    self._gateway.log_id,
-                    method,
+                    "%s Reply: `%s`", self._gateway.log_id, resulting_message
                 )
-                self._stream_writer.write("*#*1##".encode())
-                await self._stream_writer.drain()
-                raw_response = await self._stream_reader.readuntil(OWNSession.SEPARATOR)
-                resulting_message = OWNSignaling(raw_response.decode())
-                if resulting_message.is_nonce():
-                    server_random_string_ra = resulting_message.nonce
-                    # self._logger.debug("%s Received Ra.", self._gateway.log_id)
-                    key = "".join(random.choices(string.digits, k=56))
-                    client_random_string_rb = self._hex_string_to_int_string(
-                        hmac.new(key=key.encode(), digestmod=method).hexdigest()
-                    )
-                    # self._logger.debug("%s Generated Rb.", self._gateway.log_id)
-                    hashed_password = f"*#{client_random_string_rb}*{self._encode_hmac_password(method=method, password=self._gateway.password, nonce_a=server_random_string_ra, nonce_b=client_random_string_rb)}##"  # pylint: disable=line-too-long
-                    self._logger.debug(
-                        "%s Sending %s session password.",
+                self._logger.error(
+                    "%s Error while opening %s session.",
+                    self._gateway.log_id,
+                    self._type,
+                )
+            elif resulting_message.is_sha():
+                self._logger.debug(
+                    "%s Received SHA challenge: `%s`",
+                    self._gateway.log_id,
+                    resulting_message,
+                )
+                if self._gateway.password is None:
+                    error = True
+                    error_message = "password_required"
+                    self._logger.warning(
+                        "%s Connection requires a password but none was provided.",
                         self._gateway.log_id,
-                        self._type,
                     )
-                    self._stream_writer.write(hashed_password.encode())
+                    self._stream_writer.write(b"*#*0##")
                     await self._stream_writer.drain()
-                    try:
-                        raw_response = await asyncio.wait_for(
-                            self._stream_reader.readuntil(OWNSession.SEPARATOR),
-                            timeout=5,
+                else:
+                    method = "sha"
+                    if resulting_message.is_sha_1():
+                        method = "sha1"
+                    elif resulting_message.is_sha_256():
+                        method = "sha256"
+                    self._logger.debug(
+                        "%s Accepting %s challenge, initiating handshake.",
+                        self._gateway.log_id,
+                        method,
+                    )
+                    self._stream_writer.write(b"*#*1##")
+                    await self._stream_writer.drain()
+                    resulting_message = OWNSignaling(
+                        await self._read_frame(NEGOTIATION_TIMEOUT)
+                    )
+                    if resulting_message.is_nonce():
+                        server_random_string_ra = resulting_message.nonce
+                        # Rb must be unpredictable: use a CSPRNG (not `random`).
+                        key = "".join(secrets.choice(string.digits) for _ in range(56))
+                        client_random_string_rb = self._hex_string_to_int_string(
+                            hmac.new(key=key.encode(), digestmod=method).hexdigest()
                         )
-                        resulting_message = OWNSignaling(raw_response.decode())
+                        hashed_password = f"*#{client_random_string_rb}*{self._encode_hmac_password(method=method, password=self._gateway.password, nonce_a=server_random_string_ra, nonce_b=client_random_string_rb)}##"  # pylint: disable=line-too-long
+                        self._logger.debug(
+                            "%s Sending %s session password.",
+                            self._gateway.log_id,
+                            self._type,
+                        )
+                        self._stream_writer.write(hashed_password.encode())
+                        await self._stream_writer.drain()
+                        resulting_message = OWNSignaling(
+                            await self._read_frame(NEGOTIATION_TIMEOUT)
+                        )
                         if resulting_message.is_nack():
                             error = True
                             error_message = "password_error"
@@ -421,9 +499,6 @@ class OWNSession:
                                 self._type,
                             )
                         elif resulting_message.is_nonce():
-                            # self._logger.debug(
-                            #     "%s Received HMAC response.", self._gateway.log_id
-                            # )
                             hmac_response = resulting_message.nonce
                             if hmac_response == self._decode_hmac_response(
                                 method=method,
@@ -431,20 +506,18 @@ class OWNSession:
                                 nonce_a=server_random_string_ra,
                                 nonce_b=client_random_string_rb,
                             ):
-                                # self._logger.debug(
-                                #     "%s Server identity confirmed.", self._gateway.log_id
-                                # )
-                                self._stream_writer.write("*#*1##".encode())
+                                self._stream_writer.write(b"*#*1##")
                                 await self._stream_writer.drain()
                                 self._logger.debug(
-                                    "%s Session established successfully.", self._gateway.log_id
+                                    "%s Session established successfully.",
+                                    self._gateway.log_id,
                                 )
                             else:
                                 self._logger.error(
                                     "%s Server identity could not be confirmed.",
                                     self._gateway.log_id,
                                 )
-                                self._stream_writer.write("*#*0##".encode())
+                                self._stream_writer.write(b"*#*0##")
                                 await self._stream_writer.drain()
                                 error = True
                                 error_message = "negociation_error"
@@ -453,7 +526,23 @@ class OWNSession:
                                     self._gateway.log_id,
                                     self._type,
                                 )
-                    except asyncio.IncompleteReadError:
+            elif resulting_message.is_nonce():
+                self._logger.debug(
+                    "%s Received nonce: `%s`", self._gateway.log_id, resulting_message
+                )
+                if self._gateway.password is not None:
+                    hashed_password = f"*#{self._get_own_password(self._gateway.password, resulting_message.nonce)}##"  # pylint: disable=line-too-long
+                    self._logger.debug(
+                        "%s Sending %s session password.",
+                        self._gateway.log_id,
+                        self._type,
+                    )
+                    self._stream_writer.write(hashed_password.encode())
+                    await self._stream_writer.drain()
+                    resulting_message = OWNSignaling(
+                        await self._read_frame(NEGOTIATION_TIMEOUT)
+                    )
+                    if resulting_message.is_nack():
                         error = True
                         error_message = "password_error"
                         self._logger.error(
@@ -461,82 +550,63 @@ class OWNSession:
                             self._gateway.log_id,
                             self._type,
                         )
-                    except asyncio.TimeoutError:
-                        error = True
-                        error_message = "password_error"
-                        self._logger.error(
-                            "%s Password timeout error while opening %s session.",
+                    elif resulting_message.is_ack():
+                        self._logger.debug(
+                            "%s %s session established successfully.",
                             self._gateway.log_id,
-                            self._type,
+                            self._type.capitalize(),
                         )
-        elif resulting_message.is_nonce():
-            self._logger.debug(
-                "%s Received nonce: `%s`", self._gateway.log_id, resulting_message
-            )
-            if self._gateway.password is not None:
-                hashed_password = f"*#{self._get_own_password(self._gateway.password, resulting_message.nonce)}##"  # pylint: disable=line-too-long
-                self._logger.debug(
-                    "%s Sending %s session password.", self._gateway.log_id, self._type
-                )
-                self._stream_writer.write(hashed_password.encode())
-                await self._stream_writer.drain()
-                raw_response = await self._stream_reader.readuntil(OWNSession.SEPARATOR)
-                resulting_message = OWNSignaling(raw_response.decode())
-                # self._logger.debug("%s Reply: `%s`", self._gateway.log_id, resulting_message)
-                if resulting_message.is_nack():
+                else:
                     error = True
                     error_message = "password_error"
                     self._logger.error(
-                        "%s Password error while opening %s session.",
+                        "%s Connection requires a password but none was provided for %s session.",
                         self._gateway.log_id,
                         self._type,
                     )
-                elif resulting_message.is_ack():
-                    self._logger.debug(
-                        "%s %s session established successfully.",
-                        self._gateway.log_id,
-                        self._type.capitalize(),
-                    )
+            elif resulting_message.is_ack():
+                self._logger.debug(
+                    "%s %s session established successfully.",
+                    self._gateway.log_id,
+                    self._type.capitalize(),
+                )
             else:
                 error = True
-                error_message = "password_error"
-                self._logger.error(
-                    "%s Connection requires a password but none was provided for %s session.",
+                error_message = "negotiation_failed"
+                self._logger.debug(
+                    "%s Unexpected message during negotiation: %s",
                     self._gateway.log_id,
-                    self._type,
+                    resulting_message,
                 )
-        elif resulting_message.is_ack():
-            # self._logger.debug("%s Reply: `%s`", self._gateway.log_id, resulting_message)
-            self._logger.debug(
-                "%s %s session established successfully.",
-                self._gateway.log_id,
-                self._type.capitalize(),
-            )
-        else:
+        except TimeoutError:
             error = True
-            error_message = "negotiation_failed"
-            self._logger.debug(
-                "%s Unexpected message during negotiation: %s",
+            error_message = "negotiation_timeout"
+            self._logger.error(
+                "%s Timed out negotiating %s session.",
                 self._gateway.log_id,
-                resulting_message,
+                self._type,
+            )
+        except asyncio.IncompleteReadError:
+            error = True
+            error_message = "password_error"
+            self._logger.error(
+                "%s Connection closed while negotiating %s session.",
+                self._gateway.log_id,
+                self._type,
             )
 
         return {"Success": not error, "Message": error_message}
 
-    def _get_own_password(self, password, nonce, test=False):
+    def _get_own_password(self, password, nonce):
         start = True
         num1 = 0
         num2 = 0
         password = int(password)
-        if test:
-            print("password: %08x" % (password))
         for character in nonce:
             if character != "0":
                 if start:
                     num2 = password
                 start = False
-            if test:
-                print("c: %s num1: %08x num2: %08x" % (character, num1, num2))
             if character == "1":
                 num1 = (num2 & 0xFFFFFF80) >> 7
                 num2 = num2 << 25
@@ -574,26 +644,26 @@ class OWNSession:
             num2 &= 0xFFFFFFFF
             if character not in "09":
                 num1 |= num2
-            if test:
-                print("     num1: %08x num2: %08x" % (num1, num2))
             num2 = num1
         return num1
 
     def _encode_hmac_password(
         self, method: str, password: str, nonce_a: str, nonce_b: str
     ):
+        # SHA-1 here is mandated by the OpenWebNet protocol: the gateway
+        # selects the digest, the client cannot opt out. See nosec below.
         if method == "sha1":
             message = (
                 self._int_string_to_hex_string(nonce_a)
                 + self._int_string_to_hex_string(nonce_b)
                 + "736F70653E"
                 + "636F70653E"
-                + hashlib.sha1(password.encode()).hexdigest()
+                + hashlib.sha1(password.encode()).hexdigest()  # nosec B324
             )
             return self._hex_string_to_int_string(
-                hashlib.sha1(message.encode()).hexdigest()
+                hashlib.sha1(message.encode()).hexdigest()  # nosec B324
             )
-        elif method == "sha256":
+        if method == "sha256":
             message = (
                 self._int_string_to_hex_string(nonce_a)
                 + self._int_string_to_hex_string(nonce_b)
@@ -604,22 +674,23 @@ class OWNSession:
             return self._hex_string_to_int_string(
                 hashlib.sha256(message.encode()).hexdigest()
             )
-        else:
-            return None
+        return None
 
     def _decode_hmac_response(
         self, method: str, password: str, nonce_a: str, nonce_b: str
     ):
+        # SHA-1 here is mandated by the OpenWebNet protocol: the gateway
+        # selects the digest, the client cannot opt out. See nosec below.
         if method == "sha1":
             message = (
                 self._int_string_to_hex_string(nonce_a)
                 + self._int_string_to_hex_string(nonce_b)
-                + hashlib.sha1(password.encode()).hexdigest()
+                + hashlib.sha1(password.encode()).hexdigest()  # nosec B324
             )
             return self._hex_string_to_int_string(
-                hashlib.sha1(message.encode()).hexdigest()
+                hashlib.sha1(message.encode()).hexdigest()  # nosec B324
             )
-        elif method == "sha256":
+        if method == "sha256":
             message = (
                 self._int_string_to_hex_string(nonce_a)
                 + self._int_string_to_hex_string(nonce_b)
@@ -628,62 +699,117 @@ class OWNSession:
             return self._hex_string_to_int_string(
                 hashlib.sha256(message.encode()).hexdigest()
             )
-        else:
-            return None
+        return None
 
     def _int_string_to_hex_string(self, int_string: str) -> str:
         hex_string = ""
         for i in range(0, len(int_string), 2):
-            hex_string += f"{int(int_string[i:i+2]):x}"
+            hex_string += f"{int(int_string[i : i + 2]):x}"
         return hex_string
 
     def _hex_string_to_int_string(self, hex_string: str) -> str:
         int_string = ""
         for i in range(0, len(hex_string), 1):
-            int_string += f"{int(hex_string[i:i+1], 16):0>2d}"
+            int_string += f"{int(hex_string[i : i + 1], 16):0>2d}"
         return int_string
 
 
 class OWNEventSession(OWNSession):
-    def __init__(self, gateway: OWNGateway = None, logger: logging.Logger = None):
-        super().__init__(gateway=gateway, connection_type="event", logger=logger)
+    def __init__(
+        self,
+        gateway: OWNGateway | None = None,
+        logger: logging.Logger | None = None,
+        inactivity_timeout: float | None = EVENT_INACTIVITY_TIMEOUT,
+        on_state_change: Callable[[bool], None] | None = None,
+    ):
+        super().__init__(
+            gateway=gateway,
+            connection_type="event",
+            logger=logger,
+            on_state_change=on_state_change,
+        )
+        # Passive watchdog: reconnect if no frame arrives for this long.
+        # Set to None to disable (pure blocking read, never times out).
+        self._inactivity_timeout = inactivity_timeout
 
     @classmethod
     async def connect_to_gateway(cls, gateway: OWNGateway):
         connection = cls(gateway)
         await connection.connect()
 
-    async def get_next(self) -> Union[OWNMessage, str, None]:
+    async def get_next(self) -> OWNMessage | str | None:
         """Acts as an entry point to read messages on the event bus.
-        It will read one frame and return it as an OWNMessage object"""
+        It will read one frame and return it as an OWNMessage object.
+
+        Bus silence is normal, so the read does not time out aggressively;
+        however a *very* long silence (``inactivity_timeout``, set above the
+        gateway's own session lifetime) is treated as a dead connection and
+        triggers a reconnect — this catches a silent death (power loss, cable
+        pulled) where no clean FIN/RST is ever received. On any loss of
+        connectivity it transparently reconnects and returns None for that
+        cycle; the caller simply calls it again.
+        """
+        if self._stream_reader is None:
+            # No live connection (e.g. a previous reconnect attempt gave up).
+            # connect() applies its own back-off, so this is a slow retry, not
+            # a busy loop.
+            self._logger.warning(
+                "%s Event session not connected, reconnecting...",
+                self._gateway.log_id,
+            )
+            await self._reconnect()
+            return None
         try:
-            data = await self._stream_reader.readuntil(OWNSession.SEPARATOR)
+            read = self._stream_reader.readuntil(OWNSession.SEPARATOR)
+            if self._inactivity_timeout is not None:
+                data = await asyncio.wait_for(read, timeout=self._inactivity_timeout)
+            else:
+                data = await read
             _decoded_data = data.decode()
             _message = OWNMessage.parse(_decoded_data)
             return _message if _message else _decoded_data
-        except asyncio.IncompleteReadError:
+        except TimeoutError:
             self._logger.warning(
-                "%s Connection interrupted, reconnecting...", self._gateway.log_id
-            )
-            await self.connect()
-            return None
-        except AttributeError:
-            self._logger.exception(
-                "%s Received data could not be parsed into a message:",
+                "%s No bus traffic for %ss; assuming stale connection, reconnecting...",
                 self._gateway.log_id,
+                self._inactivity_timeout,
             )
+            await self._reconnect()
             return None
-        except ConnectionError:
-            self._logger.exception("%s Connection error:", self._gateway.log_id)
+        except (
+            asyncio.IncompleteReadError,
+            asyncio.LimitOverrunError,
+            ConnectionError,
+            OSError,
+        ):
+            # Covers EOF, RST (ConnectionResetError), aborted connections,
+            # over-long frames and other socket errors: reconnect in all cases.
+            self._logger.warning(
+                "%s Event connection lost, reconnecting...", self._gateway.log_id
+            )
+            await self._reconnect()
             return None
         except Exception:  # pylint: disable=broad-except
-            self._logger.exception("%s Event session crashed.", self._gateway.log_id)
+            self._logger.exception(
+                "%s Event session crashed, reconnecting...", self._gateway.log_id
+            )
+            await self._reconnect()
             return None
 
 
 class OWNCommandSession(OWNSession):
-    def __init__(self, gateway: OWNGateway = None, logger: logging.Logger = None):
-        super().__init__(gateway=gateway, connection_type="command", logger=logger)
+    def __init__(
+        self,
+        gateway: OWNGateway | None = None,
+        logger: logging.Logger | None = None,
+        on_state_change: Callable[[bool], None] | None = None,
+    ):
+        super().__init__(
+            gateway=gateway,
+            connection_type="command",
+            logger=logger,
+            on_state_change=on_state_change,
+        )
 
     @classmethod
     async def send_to_gateway(cls, message: str, gateway: OWNGateway):
@@ -696,51 +822,134 @@ class OWNCommandSession(OWNSession):
         connection = cls(gateway)
         await connection.connect()
 
-    async def send(self, message, is_status_request: bool = False, attempt: int = 1):
-        """Send the attached message on an existing 'command' connection,
-        actively reconnecting it if it had been reset."""
+    async def keepalive(self) -> bool:
+        """Send one harmless keepalive (gateway time request) on this command
+        session. Returns True if the gateway acknowledged, False otherwise.
 
+        ``send()`` already reconnects on a broken socket, so a False here means
+        the gateway is genuinely unresponsive even after a reconnect attempt.
+        """
         try:
+            await self.send(KEEPALIVE_FRAME, is_status_request=True)
+            return True
+        except Exception:  # pylint: disable=broad-except
+            self._logger.exception("%s Keepalive failed.", self._gateway.log_id)
+            return False
 
-            self._stream_writer.write(str(message).encode())
-            await self._stream_writer.drain()
-            raw_response = await self._stream_reader.readuntil(OWNSession.SEPARATOR)
-            resulting_message = OWNMessage.parse(raw_response.decode())
-
-            while not isinstance(resulting_message, OWNSignaling):
+    async def run_keepalive(
+        self, stop_event: asyncio.Event, interval: float = KEEPALIVE_INTERVAL
+    ) -> None:
+        """Background loop: ping the gateway every ``interval`` seconds until
+        ``stop_event`` is set. Meant to be launched as an asyncio task."""
+        self._logger.info(
+            "%s Keepalive started (every %ss).", self._gateway.log_id, interval
+        )
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except TimeoutError:
+                ok = await self.keepalive()
                 self._logger.debug(
-                    "%s Message `%s` received response `%s`.",
+                    "%s Keepalive %s.",
+                    self._gateway.log_id,
+                    "ok" if ok else "FAILED",
+                )
+
+    async def _read_signaling_response(self) -> OWNSignaling:
+        """Read frames until a signaling (ACK/NACK/...) message is received.
+
+        Event/command frames the gateway may interleave before the
+        acknowledgement are logged and skipped. Each read is bounded by
+        ``COMMAND_TIMEOUT`` so a silent gateway cannot block the event loop.
+        """
+        while True:
+            resulting_message = OWNMessage.parse(
+                await self._read_frame(COMMAND_TIMEOUT)
+            )
+            if isinstance(resulting_message, OWNSignaling):
+                return resulting_message
+            self._logger.debug(
+                "%s Skipping non-signaling response `%s`.",
+                self._gateway.log_id,
+                resulting_message,
+            )
+
+    async def send(self, message, is_status_request: bool = False) -> None:
+        """Send the attached message on an existing 'command' connection,
+        actively reconnecting it if it had been reset.
+
+        Retries (both on NACK and on connection reset/timeout) are bounded and
+        iterative, never recursive, so a flapping connection can neither grow
+        the call stack nor loop forever.
+        """
+        max_attempts = 3
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._stream_writer.write(str(message).encode())
+                await self._stream_writer.drain()
+
+                resulting_message = await self._read_signaling_response()
+
+                if resulting_message.is_ack():
+                    log_message = "%s Message `%s` was successfully sent."
+                    if not is_status_request:
+                        self._logger.info(log_message, self._gateway.log_id, message)
+                    else:
+                        self._logger.debug(log_message, self._gateway.log_id, message)
+                    return
+
+                if resulting_message.is_nack():
+                    if attempt < max_attempts:
+                        self._logger.error(
+                            "%s Could not send message `%s`. Retrying (%d)...",
+                            self._gateway.log_id,
+                            message,
+                            attempt,
+                        )
+                        continue
+                    self._logger.error(
+                        "%s Could not send message `%s`. No more retries.",
+                        self._gateway.log_id,
+                        message,
+                    )
+                    return
+
+                # Any other signaling message is unexpected here: stop.
+                self._logger.warning(
+                    "%s Unexpected response `%s` to message `%s`.",
+                    self._gateway.log_id,
+                    resulting_message,
+                    message,
+                )
+                return
+
+            except (ConnectionResetError, asyncio.IncompleteReadError):
+                self._logger.debug(
+                    "%s Command session connection reset, reconnecting (%d)...",
+                    self._gateway.log_id,
+                    attempt,
+                )
+                await self._reconnect()
+                continue
+            except TimeoutError:
+                self._logger.warning(
+                    "%s Timed out awaiting acknowledgement for `%s`, reconnecting (%d)...",
                     self._gateway.log_id,
                     message,
-                    resulting_message,
+                    attempt,
                 )
-                raw_response = await self._stream_reader.readuntil(OWNSession.SEPARATOR)
-                resulting_message = OWNMessage.parse(raw_response.decode())
+                await self._reconnect()
+                continue
+            except Exception:  # pylint: disable=broad-except
+                self._logger.exception(
+                    "%s Command session crashed.", self._gateway.log_id
+                )
+                return
 
-            if resulting_message.is_nack():
-                if attempt <= 2:
-                    self._logger.error(
-                        "%s Could not send message `%s`. Retrying (%d)...", self._gateway.log_id, message,
-                        attempt
-                    )
-                    return await self.send(message, is_status_request, attempt + 1)
-                else:
-                    self._logger.error(
-                        "%s Could not send message `%s`. No more retries.", self._gateway.log_id, message
-                    )
-            elif resulting_message.is_ack():
-                log_message = "%s Message `%s` was successfully sent."
-                if not is_status_request:
-                    self._logger.info(log_message, self._gateway.log_id, message)
-                else:
-                    self._logger.debug(log_message, self._gateway.log_id, message)
-                    
-        except (ConnectionResetError, asyncio.IncompleteReadError):
-            self._logger.debug(
-                "%s Command session connection reset, retrying...", self._gateway.log_id
-            )
-            await self.connect()
-            await self.send(message=message, is_status_request=is_status_request)
-        except Exception:  # pylint: disable=broad-except
-            self._logger.exception("%s Command session crashed.", self._gateway.log_id)
-            return None
+        self._logger.error(
+            "%s Could not send message `%s` after %d attempts.",
+            self._gateway.log_id,
+            message,
+            max_attempts,
+        )

@@ -1,2 +1,3 @@
-""" OWNd - an OpenWebNet daemon """  # pylint: disable=invalid-name
+"""OWNd - an OpenWebNet daemon"""  # pylint: disable=invalid-name
+
 __version__ = "0.7.49"

@@ -1,39 +1,36 @@
-# OWNd
+# OWNd (Fork)
 
-This package is an event listener and command forwarder for the OpenWebNet protocol.
+This package is an event listener and command forwarder for the OpenWebNet protocol, tailored for Home Assistant integration.
 
-It is mainly intended to be used in an Home-Assistant integration.
+> **Note on this Fork:** This is a modified fork of the original `OWNd` library by **anotherjulien** (v0.7.48). It includes critical hardening for connection stability, keepalive fixes for MH201 gateways, and updates to comply with modern Home Assistant development standards.
 
-At this point most events are understood.
-WHO = 5 (Burglar Alarm) event support is limited and needs further development.
-Many commands are implemented, mostly within the requirements of Home-Assistant.
+## Key Enhancements in this Fork
+- **Connection Hardening:** Reconnection mechanism now handles all connectivity drops (EOF, TCP resets/RST, aborted connections). Modernized `connect()` with strict timeouts to prevent hangs on unreachable hosts.
+- **Robust Command Delivery:** `OWNCommandSession.send` rewritten as an iterative loop (3 retries max) instead of recursion, preventing stack overflows on unstable lines.
+- **HA Modernization & Security:** Upgraded to target Python 3.14+, replaced `pytz` with native `zoneinfo`, and migrated `xml.dom.minidom` to `defusedxml` to address potential security vectors (Bandit/Ruff clean).
+- **Injectable Sessions:** `aiohttp` sessions can now be injected directly from Home Assistant's `config_flow`.
+
+---
 
 ## Testing OWNd
 
-Testing OWNd is pretty simple. 
-Clone this repository and then:
+Clone this repository and then execute:
 
-```
-cd <OWNd checkout folder>
+```bash
+cd OWNd
 pip3 install .
-python3 -m OWNd --help    # to visualize possible options
+python3 -m OWNd --help
 ```
 
-To attempt connection to the first available OpenWebNet gateway in the local area network you 
-can run:
-
-```
+### Auto-Discovery Connection
+To automatically discover the first available OpenWebNet gateway via SSDP on your local network:
+```bash
 python3 -m OWNd
 ```
 
-This will use [SSDP](https://en.wikipedia.org/wiki/Simple_Service_Discovery_Protocol) to discover
-all supported gateways and pick the first one.
-
-Alternatively, if you want to skip the SSDP discovery step, you can provide the IP address, port 
-and MAC address of the gateway from command-line:
-
+### Manual Connection
+To skip discovery and force connection to a specific gateway:
+```bash
+python3 -m OWNd --address <IP_ADDRESS> --port <PORT> --password <PASSWORD> --mac <MAC_ADDRESS>
 ```
-python3 -m OWNd --address <IP address> --port <PORT> --password <PASS> --mac <MAC address>
-```
-
-Note that all these details can be retrieved using bTICINO Home+Project Android application.
+*Note: Gateway configuration parameters can be retrieved using the BTicino Home+Project application.*

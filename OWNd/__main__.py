@@ -1,13 +1,16 @@
-""" OWNd entry point when running it directly from CLI
+"""OWNd entry point when running it directly from CLI
 (as opposed to imported into another project)
 """
+
 import argparse
 import asyncio
+import contextlib
 import logging
-
-from .message import OWNMessage
+import signal
+import sys
 
 from .connection import OWNEventSession, OWNGateway
+from .message import OWNMessage
 
 
 async def main(arguments: dict, connection: OWNEventSession) -> None:
@@ -56,7 +59,7 @@ async def main(arguments: dict, connection: OWNEventSession) -> None:
     logger.info("Starting connection to the discovered gateway")
     await connection.connect()
 
-    logger.info("Now waiting for events from the gateway (e.g. a cover opening/closing)")
+    logger.info("Now waiting for events from the gateway (e.g. BUS frames)")
     while True:
         message = await connection.get_next()
         if message:
@@ -65,8 +68,81 @@ async def main(arguments: dict, connection: OWNEventSession) -> None:
                 logger.info(message.human_readable_log)
 
 
-if __name__ == "__main__":
+# ---------------------------
+# Modern, Python 3.13-safe CLI
+# ---------------------------
 
+
+def _build_logger(verbosity: int) -> logging.Logger:
+    # Use a consistent, propagate-able logger name
+    logger = logging.getLogger("ownd")
+    logger.setLevel(logging.DEBUG)
+
+    # Avoid adding duplicate handlers if module is re-imported
+    if not logger.handlers:
+        stream = logging.StreamHandler(sys.stdout)
+        if verbosity == 2:
+            stream.setLevel(logging.DEBUG)
+        elif verbosity == 0:
+            stream.setLevel(logging.WARNING)
+        else:
+            stream.setLevel(logging.INFO)
+
+        stream.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
+        logger.addHandler(stream)
+
+    # Let messages also propagate to HA's root logger when imported there
+    logger.propagate = True
+    return logger
+
+
+async def _async_entry(_arguments: dict, event_session: OWNEventSession) -> None:
+    logger: logging.Logger = _arguments["logger"]
+
+    # Graceful shutdown support where signals are available
+    stop_event = asyncio.Event()
+    try:
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+        loop.add_signal_handler(signal.SIGINT, stop_event.set)
+    except (NotImplementedError, RuntimeError):
+        # Windows or restricted env: signals may be unavailable
+        pass
+
+    logger.info("Starting OWNd.")
+    runner = asyncio.create_task(main(_arguments, event_session), name="ownd-main")
+
+    try:
+        # Wait for either main task to finish (error) or a stop signal
+        done, pending = await asyncio.wait(
+            {runner, asyncio.create_task(stop_event.wait(), name="ownd-stop")},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # If main task raised, surface the exception
+        if runner in done:
+            exc = runner.exception()
+            if exc:
+                logger.exception("OWNd crashed", exc_info=exc)
+                raise exc
+    finally:
+        logger.info("Stopping OWNd.")
+        # Cancel background tasks if still running
+        if not runner.done():
+            runner.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await runner
+
+        # Close the event session cleanly
+        try:
+            await event_session.close()
+        finally:
+            logger.info("OWNd stopped.")
+
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-a", "--address", type=str, help="IP address of the OpenWebNet gateway"
@@ -75,7 +151,7 @@ if __name__ == "__main__":
         "-p",
         "--port",
         type=int,
-        help="TCP port to connectect the gateway, default is 20000",
+        help="TCP port to connect the gateway, default is 20000",
     )
     parser.add_argument(
         "-P",
@@ -87,7 +163,7 @@ if __name__ == "__main__":
         "-m",
         "--mac",
         type=str,
-        help="MAC address of the gateway (to be used as ID, if  not found via SSDP)",
+        help="MAC address of the gateway (to be used as ID, if not found via SSDP)",
     )
     parser.add_argument(
         "-v",
@@ -97,27 +173,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # create logger with 'OWNd'
-    _logger = logging.getLogger("OWNd")
-    _logger.setLevel(logging.DEBUG)
-
-    # create console handler which logs even debug messages
-    log_stream_handler = logging.StreamHandler()
-
-    if args.verbose == 2:
-        log_stream_handler.setLevel(logging.DEBUG)
-    elif args.verbose == 0:
-        log_stream_handler.setLevel(logging.WARNING)
-    else:
-        log_stream_handler.setLevel(logging.INFO)
-
-    # create formatter and add it to the handlers
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-    log_stream_handler.setFormatter(formatter)
-    # add the handlers to the logger
-    _logger.addHandler(log_stream_handler)
+    _logger = _build_logger(args.verbose if args.verbose is not None else 1)
 
     event_session = OWNEventSession(gateway=None, logger=_logger)
     _arguments = {
@@ -128,19 +184,7 @@ if __name__ == "__main__":
         "logger": _logger,
     }
 
-    loop = asyncio.get_event_loop()
-    main_task = asyncio.ensure_future(main(_arguments, event_session))
-    # loop.set_debug(True)
-
     try:
-        _logger.info("Starting OWNd.")
-        loop.run_forever()
-        # asyncio.run(main(arguments))
+        asyncio.run(_async_entry(_arguments, event_session))
     except KeyboardInterrupt:
-        _logger.info("Stoping OWNd.")
-        main_task.cancel()
-        loop.run_until_complete(event_session.close())
-        loop.stop()
-        loop.close()
-    finally:
-        _logger.info("OWNd stopped.")
+        _logger.info("OWNd interrupted by user.")

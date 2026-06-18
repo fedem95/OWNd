@@ -1,13 +1,12 @@
-""" This module contains OpenWebNet messages definition """  # pylint: disable=too-many-lines
+"""This module contains OpenWebNet messages definition"""  # pylint: disable=too-many-lines
 
 from __future__ import annotations
 
 import datetime
 import re
-from typing import Optional
+from zoneinfo import ZoneInfo
 
 from dateutil.relativedelta import relativedelta
-import pytz
 
 MESSAGE_TYPE_ACTIVE_POWER = "active_power"
 MESSAGE_TYPE_ENERGY_TOTALIZER = "energy_totalizer"
@@ -155,7 +154,7 @@ class OWNMessage:
             del self._dimension_value[0]
 
     @classmethod
-    def parse(cls, data) -> Optional[OWNMessage]:
+    def parse(cls, data) -> OWNMessage | None:
         if (
             cls._ACK.match(data)
             or cls._NACK.match(data)
@@ -165,16 +164,15 @@ class OWNMessage:
             or cls._SHA.match(data)
         ):
             return OWNSignaling(data)
-        elif cls._STATUS.match(data) or cls._DIMENSION_REQUEST_REPLY.match(data):
+        if cls._STATUS.match(data) or cls._DIMENSION_REQUEST_REPLY.match(data):
             return OWNEvent.parse(data)
-        elif (
+        if (
             cls._STATUS_REQUEST.match(data)
             or cls._DIMENSION_REQUEST.match(data)
             or cls._DIMENSION_WRITING.match(data)
         ):
             return OWNCommand.parse(data)
-        else:
-            return None
+        return None
 
     @property
     def is_event(self) -> bool:
@@ -277,26 +275,20 @@ class OWNMessage:
     @property
     def is_general(self) -> bool:
         if self.who == 1 or self.who == 2:
-            if self._where == "0":
-                return True
-        else:
-            return False
+            return self._where == "0"
+        return False
 
     @property
     def is_group(self) -> bool:
         if self.who == 1 or self.who == 2:
-            if self._where.startswith("#"):
-                return True
-            else:
-                return False
-        else:
-            return False
+            return self._where.startswith("#")
+        return False
 
     @property
     def is_area(self) -> bool:
         if self.who == 1 or self.who == 2:
             try:
-                if (
+                return (
                     self._where == "00"
                     or self._where == "100"
                     or (
@@ -304,28 +296,22 @@ class OWNMessage:
                         and int(self._where) > 0
                         and int(self._where) < 10
                     )
-                ):
-                    return True
-                else:
-                    return False
+                )
             except ValueError:
                 return False
-        else:
-            return False
+        return False
 
     @property
     def group(self) -> int:
         if self.is_group:
             return int(self._where[1:])
-        else:
-            return None
+        return None
 
     @property
     def area(self) -> int:
         if self.is_area:
             return 10 if self._where == "100" else int(self._where)
-        else:
-            return None
+        return None
 
     def __repr__(self) -> str:
         return self._raw
@@ -342,7 +328,7 @@ class OWNEvent(OWNMessage):
     """
 
     @classmethod
-    def parse(cls, data) -> Optional[OWNEvent]:
+    def parse(cls, data) -> OWNEvent | None:
         _match = re.match(r"^\*#?(?P<who>\d+)\*.+##$", data)
 
         if _match:
@@ -350,29 +336,29 @@ class OWNEvent(OWNMessage):
 
             if _who == 0:
                 return OWNScenarioEvent(data)
-            elif _who == 1:
+            if _who == 1:
                 return OWNLightingEvent(data)
-            elif _who == 2:
+            if _who == 2:
                 return OWNAutomationEvent(data)
-            elif _who == 4:
+            if _who == 4:
                 return OWNHeatingEvent(data)
-            elif _who == 5:
+            if _who == 5:
                 return OWNAlarmEvent(data)
-            elif _who == 9:
+            if _who == 9:
                 return OWNAuxEvent(data)
-            elif _who == 13:
+            if _who == 13:
                 return OWNGatewayEvent(data)
-            elif _who == 15:
+            if _who == 15:
                 return OWNCENEvent(data)
-            elif _who == 17:
+            if _who == 17:
                 return OWNSceneEvent(data)
-            elif _who == 18:
+            if _who == 18:
                 return OWNEnergyEvent(data)
-            elif _who == 25:
+            if _who == 25:
                 _where = re.match(r"^\*.+\*(?P<where>\d+)##$", data).group("where")
                 if _where.startswith("2"):
                     return OWNCENPlusEvent(data)
-                elif _where.startswith("3"):
+                if _where.startswith("3"):
                     return OWNDryContactEvent(data)
             elif _who > 1000:
                 return cls(data)
@@ -558,12 +544,11 @@ class OWNAutomationEvent(OWNEvent):
         if self._what is not None and self._what != 1000:
             self._state = self._what
 
-        if self._dimension is not None:
-            if self._dimension == 10:
-                self._state = int(self._dimension_value[0])
-                self._position = int(self._dimension_value[1])
-                self._priority = int(self._dimension_value[2])
-                self._info = int(self._dimension_value[3])
+        if self._dimension is not None and self._dimension == 10:
+            self._state = int(self._dimension_value[0])
+            self._position = int(self._dimension_value[1])
+            self._priority = int(self._dimension_value[2])
+            self._info = int(self._dimension_value[3])
 
         if self._state == 0:
             self._human_readable_log = (
@@ -913,10 +898,9 @@ class OWNHeatingEvent(OWNEvent):
         """The ID of the subject of this message"""
         if self._zone == 0:
             return f"{self._who}-#0"
-        elif self._sensor is not None:
+        if self._sensor is not None:
             return f"{self._who}-{self._where}"
-        else:
-            return f"{self._who}-{self._zone}"
+        return f"{self._who}-{self._zone}"
 
     @property
     def message_type(self):
@@ -1259,7 +1243,7 @@ class OWNGatewayEvent(OWNEvent):
             self._month = self._dimension_value[6]
             self._year = self._dimension_value[7]
             self._datetime = datetime.datetime.fromisoformat(
-                f"{self._year}-{self._month}-{self._day}*{self._hour}:{self._minute}:{self._second}{self._timezone}"  # pylint: disable=line-too-long
+                f"{self._year}-{self._month}-{self._day}T{self._hour}:{self._minute}:{self._second}{self._timezone}"  # pylint: disable=line-too-long
             )
             self._human_readable_log = (
                 f"Gateway's internal datetime is: {self._datetime}."
@@ -1347,19 +1331,17 @@ class OWNSceneEvent(OWNEvent):
     def is_on(self):
         if self._state == 1:
             return True
-        elif self._state == 2:
+        if self._state == 2:
             return False
-        else:
-            return None
+        return None
 
     @property
     def is_enabled(self):
         if self._state == 3:
             return True
-        elif self._state == 4:
+        if self._state == 4:
             return False
-        else:
-            return None
+        return None
 
 
 class OWNEnergyEvent(OWNEvent):
@@ -1367,16 +1349,16 @@ class OWNEnergyEvent(OWNEvent):
         super().__init__(data)
 
         if not self._where.startswith("5") and not self._where.startswith("7"):
-            return None
+            return
 
         self._type = None
         self._sensor = self._where[1:]
         self._active_power = 0
         self._total_consumption = 0
-        self._hourly_consumption = dict()
-        self._daily_consumption = dict()
+        self._hourly_consumption = {}
+        self._daily_consumption = {}
         self._current_day_partial_consumption = 0
-        self._monthly_consumption = dict()
+        self._monthly_consumption = {}
         self._current_month_partial_consumption = 0
 
         if self._dimension is not None:
@@ -1405,7 +1387,7 @@ class OWNEnergyEvent(OWNEvent):
                             int(self._dimension_param[1]),
                         )
                 except ValueError:
-                    return None
+                    return
 
                 if int(self._dimension_value[0]) != 25:
                     self._type = MESSAGE_TYPE_HOURLY_CONSUMPTION
@@ -1450,7 +1432,7 @@ class OWNEnergyEvent(OWNEvent):
                             int(self._dimension_value[0]),
                         )
                 except ValueError:
-                    return None
+                    return
                 self._type = MESSAGE_TYPE_DAILY_CONSUMPTION
                 self._daily_consumption["date"] = _message_date
                 self._daily_consumption["value"] = int(self._dimension_value[1])
@@ -1613,7 +1595,7 @@ class OWNCommand(OWNMessage):
     """
 
     @classmethod
-    def parse(cls, data) -> Optional[OWNCommand]:
+    def parse(cls, data) -> OWNCommand | None:
         _match = re.match(r"^\*#?(?P<who>\d+)\*.+##$", data)
 
         if _match:
@@ -1621,43 +1603,29 @@ class OWNCommand(OWNMessage):
 
             if _who == 0:
                 return cls(data)
-            elif _who == 1:
+            if _who == 1:
                 return OWNLightingCommand(data)
-            elif _who == 2:
+            if _who == 2:
                 return OWNAutomationCommand(data)
-            elif _who == 3:  # Charges / Loads ?
+            if _who == 3:  # Charges / Loads ?
                 return cls(data)
-            elif _who == 4:
+            if _who == 4:
                 return OWNHeatingCommand(data)
-            elif _who == 5:
+            if _who == 5 or _who == 6 or _who == 7 or _who == 9:
                 return cls(data)
-            elif _who == 6:  # VDES
-                return cls(data)
-            elif _who == 7:
-                return cls(data)
-            elif _who == 9:
-                return cls(data)
-            elif _who == 13:
+            if _who == 13:
                 return OWNGatewayCommand(data)
-            elif _who == 14:
+            if _who == 14 or _who == 15 or _who == 16 or _who == 17:
                 return cls(data)
-            elif _who == 15:
-                return cls(data)
-            elif _who == 16:
-                return cls(data)
-            elif _who == 17:
-                return cls(data)
-            elif _who == 18:
+            if _who == 18:
                 return OWNEnergyCommand(data)
-            elif _who == 22:
+            if _who == 22 or _who == 24:
                 return cls(data)
-            elif _who == 24:
-                return cls(data)
-            elif _who == 25:
+            if _who == 25:
                 _where = re.match(r"^\*.+\*(?P<where>\d+)##$", data).group("where")
                 if _where.startswith("2"):
                     return cls(data)
-                elif _where.startswith("3"):
+                if _where.startswith("3"):
                     return OWNDryContactCommand(data)
             elif _who > 1000:
                 return cls(data)
@@ -1948,7 +1916,7 @@ class OWNGatewayCommand(OWNCommand):
             self._month = self._dimension_value[6]
             self._year = self._dimension_value[7]
             self._datetime = datetime.datetime.fromisoformat(
-                f"{self._year}-{self._month}-{self._day}*{self._hour}:{self._minute}:{self._second}{self._timezone}"  # pylint: disable=line-too-long
+                f"{self._year}-{self._month}-{self._day}T{self._hour}:{self._minute}:{self._second}{self._timezone}"  # pylint: disable=line-too-long
             )
             self._human_readable_log = (
                 f"Gateway broadcasting internal datetime: {self._datetime}."
@@ -1956,8 +1924,8 @@ class OWNGatewayCommand(OWNCommand):
 
     @classmethod
     def set_datetime_to_now(cls, time_zone: str):
-        timezone = pytz.timezone(time_zone)
-        now = timezone.localize(datetime.datetime.now())
+        timezone = ZoneInfo(time_zone)
+        now = datetime.datetime.now(timezone)
         timezone_offset = (
             f"0{now.strftime('%z')[1:3]}"
             if now.strftime("%z")[0] == "+"
@@ -1971,16 +1939,16 @@ class OWNGatewayCommand(OWNCommand):
 
     @classmethod
     def set_date_to_today(cls, time_zone: str):
-        timezone = pytz.timezone(time_zone)
-        now = timezone.localize(datetime.datetime.now())
+        timezone = ZoneInfo(time_zone)
+        now = datetime.datetime.now(timezone)
         message = cls(f"*#13**#1*0{now.strftime('%w*%d*%m*%Y##')}")
         message._human_readable_log = f"Setting gateway date to: {message._date}."
         return message
 
     @classmethod
     def set_time_to_now(cls, time_zone: str):
-        timezone = pytz.timezone(time_zone)
-        now = timezone.localize(datetime.datetime.now())
+        timezone = ZoneInfo(time_zone)
+        now = datetime.datetime.now(timezone)
         timezone_offset = (
             f"0{now.strftime('%z')[1:3]}"
             if now.strftime("%z")[0] == "+"
@@ -2033,7 +2001,7 @@ class OWNEnergyCommand(OWNCommand):
         target = datetime.date(year=year, month=month, day=1)
         if target > today:
             return None
-        elif target > one_year_ago:
+        if target > one_year_ago:
             message = cls(f"*18*59#{month}*{where}##")
         elif target > two_year_ago:
             message = cls(f"*18*510#{month}*{where}##")
@@ -2126,16 +2094,14 @@ class OWNSignaling(OWNMessage):
         """Return the authentication nonce IF the message is a nonce message"""
         if self.is_nonce:  # pylint: disable=using-constant-test
             return self._match.group(1)
-        else:
-            return None
+        return None
 
     @property
     def sha_version(self):
         """Return the authentication SHA version IF the message is a SHA challenge message"""
         if self.is_sha:  # pylint: disable=using-constant-test
             return self._match.group(1)
-        else:
-            return None
+        return None
 
     def is_ack(self) -> bool:
         return self._type == "ACK"

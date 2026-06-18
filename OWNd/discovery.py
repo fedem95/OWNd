@@ -1,12 +1,21 @@
-""" OWNd mechanism for discovering gateways on local network """
+"""OWNd mechanism for discovering gateways on local network"""
+
+from __future__ import annotations
 
 import asyncio
 import email.parser
 import socket
-import xml.dom.minidom
+from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
 import aiohttp
+
+# Use defusedxml instead of the stdlib XML parser: the XML processed here comes
+# from network-discovered (and therefore untrusted) SSDP/SCPD endpoints, and the
+# stdlib expat parser is vulnerable to entity-expansion / quadratic-blowup DoS.
+from defusedxml.minidom import parseString
+
+DEFAULT_PORT = 20000
 
 
 class SSDPMessage:
@@ -52,9 +61,7 @@ class SSDPMessage:
 
     def __bytes__(self):
         """Return full HTTP message as bytes."""
-        _bytes = self.__str__().encode().replace(b"\n", b"\r\n")
-        _bytes = _bytes + b"\r\n\r\n"
-        return _bytes
+        return self.__str__().encode().replace(b"\n", b"\r\n") + b"\r\n\r\n"
 
 
 class SSDPResponse(SSDPMessage):
@@ -77,10 +84,10 @@ class SSDPResponse(SSDPMessage):
 
     def __str__(self):
         """Return complete SSDP response."""
-        lines = list()
+        lines = []
         lines.append(" ".join([self.version, str(self.status_code), self.reason]))
         for header in self.headers:
-            lines.append("%s: %s" % header)
+            lines.append(f"{header[0]}: {header[1]}")
         return "\n".join(lines)
 
 
@@ -102,10 +109,10 @@ class SSDPRequest(SSDPMessage):
 
     def __str__(self):
         """Return complete SSDP request."""
-        lines = list()
+        lines = []
         lines.append(" ".join([self.method, self.uri, self.version]))
         for header in self.headers:
-            lines.append("%s: %s" % header)
+            lines.append(f"{header[0]}: {header[1]}")
         return "\n".join(lines)
 
 
@@ -157,7 +164,6 @@ class SimpleServiceDiscoveryProtocol(asyncio.DatagramProtocol):
                     "uuid:upnp-IPscenarioModule-"
                 )
             ):
-
                 self._recvq.put_nowait(
                     {
                         "address": addr[0],
@@ -178,8 +184,22 @@ class SimpleServiceDiscoveryProtocol(asyncio.DatagramProtocol):
             self._transport = None
 
 
+@asynccontextmanager
+async def _client_session(session: aiohttp.ClientSession | None):
+    """Yield the caller-provided aiohttp session, or a short-lived one.
+
+    Passing in Home Assistant's shared session avoids spinning up (and tearing
+    down) a fresh connector on every discovery call.
+    """
+    if session is not None:
+        yield session
+    else:
+        async with aiohttp.ClientSession() as owned_session:
+            yield owned_session
+
+
 def _get_soap_body(namespace: str, action: str) -> str:
-    soap_body = f"""
+    return f"""
         <?xml version="1.0"?>
 
         <soap:Envelope
@@ -193,16 +213,16 @@ def _get_soap_body(namespace: str, action: str) -> str:
 
         </soap:Envelope>
     """
-    return soap_body
 
 
-async def get_port(scpd_location: str) -> int:
+async def get_port(
+    scpd_location: str, session: aiohttp.ClientSession | None = None
+) -> int:
 
     host = urlparse(scpd_location).netloc
     scheme = urlparse(scpd_location).scheme
     try:
-        async with aiohttp.ClientSession() as session:
-
+        async with _client_session(session) as http_session:
             service_ns = "urn:schemas-bticino-it:service:openserver:1"
             service_action = "getopenserverPort"
             service_control = "upnp/pwdControl"
@@ -216,28 +236,25 @@ async def get_port(scpd_location: str) -> int:
             }
 
             ctrl_url = f"{scheme}://{host}/{service_control}"
-            resp = await session.post(ctrl_url, data=soap_body, headers=headers)
-            soap_response = xml.dom.minidom.parseString(
-                await resp.text()
-            ).documentElement
-            await session.close()
+            resp = await http_session.post(ctrl_url, data=soap_body, headers=headers)
+            soap_response = parseString(await resp.text()).documentElement
 
         return int(soap_response.getElementsByTagName("Port")[0].childNodes[0].data)
     except aiohttp.client_exceptions.ServerDisconnectedError:
-        return 20000
+        return DEFAULT_PORT
     except aiohttp.client_exceptions.ClientOSError:
-        return 20000
+        return DEFAULT_PORT
 
 
-async def _get_scpd_details(scpd_location: str) -> dict:
+async def _get_scpd_details(
+    scpd_location: str, session: aiohttp.ClientSession | None = None
+) -> dict:
 
-    discovery_info = dict()
+    discovery_info = {}
 
-    async with aiohttp.ClientSession() as session:
-        scpd_response = await session.get(scpd_location)
-        scpd_xml = xml.dom.minidom.parseString(
-            await scpd_response.text()
-        ).documentElement
+    async with _client_session(session) as http_session:
+        scpd_response = await http_session.get(scpd_location)
+        scpd_xml = parseString(await scpd_response.text()).documentElement
 
         discovery_info["deviceType"] = (
             scpd_xml.getElementsByTagName("deviceType")[0].childNodes[0].data
@@ -267,16 +284,14 @@ async def _get_scpd_details(scpd_location: str) -> dict:
             scpd_xml.getElementsByTagName("UDN")[0].childNodes[0].data
         )
 
-        discovery_info["port"] = await get_port(scpd_location)
-
-        await session.close()
+        discovery_info["port"] = await get_port(scpd_location, session=http_session)
 
     return discovery_info
 
 
-async def find_gateways() -> list:
+async def find_gateways(session: aiohttp.ClientSession | None = None) -> list[dict]:
 
-    return_list = list()
+    return_list = []
 
     # Start the asyncio loop.
     loop = asyncio.get_running_loop()
@@ -310,18 +325,23 @@ async def find_gateways() -> list:
 
     while not recvq.empty():
         discovery_info = await recvq.get()
-        discovery_info.update(await _get_scpd_details(discovery_info["ssdp_location"]))
+        discovery_info.update(
+            await _get_scpd_details(discovery_info["ssdp_location"], session=session)
+        )
 
         return_list.append(discovery_info)
 
     return return_list
 
 
-async def get_gateway(address: str) -> dict:
-    _local_gateways = await find_gateways()
+async def get_gateway(
+    address: str, session: aiohttp.ClientSession | None = None
+) -> dict | None:
+    _local_gateways = await find_gateways(session=session)
     for _gateway in _local_gateways:
         if _gateway["address"] == address:
             return _gateway
+    return None
 
 
 if __name__ == "__main__":
