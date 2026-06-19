@@ -885,6 +885,22 @@ class OWNCommandSession(OWNSession):
         max_attempts = 3
 
         for attempt in range(1, max_attempts + 1):
+            # After an outage the previous connect()/reconnect may have given up
+            # and left the writer at None; rebuild the session here so commands
+            # resume automatically when the gateway comes back, instead of
+            # crashing forever on `NoneType.write`.
+            if self._stream_writer is None:
+                await self.connect()
+            if self._stream_writer is None:
+                # Still unreachable: drop THIS message without killing the
+                # worker; the next command will try to reconnect again.
+                self._logger.warning(
+                    "%s Command session unavailable; message `%s` not sent.",
+                    self._gateway.log_id,
+                    message,
+                )
+                return
+
             try:
                 self._stream_writer.write(str(message).encode())
                 await self._stream_writer.drain()
@@ -924,7 +940,7 @@ class OWNCommandSession(OWNSession):
                 )
                 return
 
-            except (ConnectionResetError, asyncio.IncompleteReadError):
+            except (ConnectionResetError, asyncio.IncompleteReadError, OSError):
                 self._logger.debug(
                     "%s Command session connection reset, reconnecting (%d)...",
                     self._gateway.log_id,
