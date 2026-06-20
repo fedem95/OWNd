@@ -20,7 +20,7 @@ MESSAGE_TYPE_MAIN_HUMIDITY = "main_humidity"
 MESSAGE_TYPE_SECONDARY_TEMPERATURE = "secondary_temperature"
 MESSAGE_TYPE_TARGET_TEMPERATURE = "target_temperature"
 MESSAGE_TYPE_LOCAL_OFFSET = "local_offset"
-MESSAGE_TYPE_LOCAL_TARGET_TEMPERATURE = "local_targer_temperature"
+MESSAGE_TYPE_LOCAL_TARGET_TEMPERATURE = "local_target_temperature"
 MESSAGE_TYPE_MODE = "hvac_mode"
 MESSAGE_TYPE_MODE_TARGET = "hvac_mode_target"
 MESSAGE_TYPE_ACTION = "hvac_action"
@@ -567,29 +567,28 @@ class OWNAutomationEvent(OWNEvent):
             else:
                 self._human_readable_log = f"Cover {self._where}{self._interface_log_text} is opened at {self._position}%."
                 self._is_closed = False
-        else:
-            if self._state == 1:
-                self._human_readable_log = (
-                    f"Cover {self._where}{self._interface_log_text} is opening."
-                )
-                self._is_opening = True
-                self._is_closing = False
-            elif self._state == 11 or self._state == 13:
-                self._human_readable_log = f"Cover {self._where}{self._interface_log_text} is opening from initial position {self._position}."  # pylint: disable=line-too-long
-                self._is_opening = True
-                self._is_closing = False
-                self._is_closed = False
-            elif self._state == 2:
-                self._human_readable_log = (
-                    f"Cover {self._where}{self._interface_log_text} is closing."
-                )
-                self._is_closing = True
-                self._is_opening = False
-            elif self._state == 12 or self._state == 14:
-                self._human_readable_log = f"Cover {self._where}{self._interface_log_text} is closing from initial position {self._position}."  # pylint: disable=line-too-long
-                self._is_closing = True
-                self._is_opening = False
-                self._is_closed = False
+        elif self._state == 1:
+            self._human_readable_log = (
+                f"Cover {self._where}{self._interface_log_text} is opening."
+            )
+            self._is_opening = True
+            self._is_closing = False
+        elif self._state == 11 or self._state == 13:
+            self._human_readable_log = f"Cover {self._where}{self._interface_log_text} is opening from initial position {self._position}."  # pylint: disable=line-too-long
+            self._is_opening = True
+            self._is_closing = False
+            self._is_closed = False
+        elif self._state == 2:
+            self._human_readable_log = (
+                f"Cover {self._where}{self._interface_log_text} is closing."
+            )
+            self._is_closing = True
+            self._is_opening = False
+        elif self._state == 12 or self._state == 14:
+            self._human_readable_log = f"Cover {self._where}{self._interface_log_text} is closing from initial position {self._position}."  # pylint: disable=line-too-long
+            self._is_closing = True
+            self._is_opening = False
+            self._is_closed = False
 
     @property
     def state(self):

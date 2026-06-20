@@ -7,6 +7,7 @@ import email.parser
 import socket
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
+from xml.parsers.expat import ExpatError
 
 import aiohttp
 
@@ -16,6 +17,21 @@ import aiohttp
 from defusedxml.minidom import parseString
 
 DEFAULT_PORT = 20000
+# Bound discovery HTTP calls: a gateway that accepts the connection but never
+# answers must not hang the discovery task indefinitely.
+DISCOVERY_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+
+
+def _node_text(xml, tag: str, default: str | None = None) -> str | None:
+    """Text of the first <tag> element, or default if missing/empty.
+
+    Guards against malformed or non-conforming XML (and HTML error pages):
+    getElementsByTagName(...)[0] would otherwise raise IndexError.
+    """
+    nodes = xml.getElementsByTagName(tag)
+    if not nodes or not nodes[0].childNodes:
+        return default
+    return nodes[0].childNodes[0].data
 
 
 class SSDPMessage:
@@ -236,13 +252,20 @@ async def get_port(
             }
 
             ctrl_url = f"{scheme}://{host}/{service_control}"
-            resp = await http_session.post(ctrl_url, data=soap_body, headers=headers)
+            resp = await http_session.post(
+                ctrl_url,
+                data=soap_body,
+                headers=headers,
+                timeout=DISCOVERY_HTTP_TIMEOUT,
+            )
+            resp.raise_for_status()
             soap_response = parseString(await resp.text()).documentElement
 
-        return int(soap_response.getElementsByTagName("Port")[0].childNodes[0].data)
-    except aiohttp.client_exceptions.ServerDisconnectedError:
-        return DEFAULT_PORT
-    except aiohttp.client_exceptions.ClientOSError:
+        port = _node_text(soap_response, "Port")
+        return int(port) if port is not None else DEFAULT_PORT
+    except (aiohttp.ClientError, ExpatError, IndexError, ValueError):
+        # Unreachable gateway, HTTP error page, malformed/missing XML, timeout:
+        # fall back to the default port instead of crashing discovery.
         return DEFAULT_PORT
 
 
@@ -253,36 +276,24 @@ async def _get_scpd_details(
     discovery_info = {}
 
     async with _client_session(session) as http_session:
-        scpd_response = await http_session.get(scpd_location)
+        scpd_response = await http_session.get(
+            scpd_location, timeout=DISCOVERY_HTTP_TIMEOUT
+        )
+        scpd_response.raise_for_status()
         scpd_xml = parseString(await scpd_response.text()).documentElement
 
-        discovery_info["deviceType"] = (
-            scpd_xml.getElementsByTagName("deviceType")[0].childNodes[0].data
-        )
-        discovery_info["friendlyName"] = (
-            scpd_xml.getElementsByTagName("friendlyName")[0].childNodes[0].data
-        )
-        discovery_info["manufacturer"] = (
-            scpd_xml.getElementsByTagName("manufacturer")[0].childNodes[0].data
-        )
-        discovery_info["manufacturerURL"] = (
-            scpd_xml.getElementsByTagName("manufacturerURL")[0].childNodes[0].data
-        )
-        discovery_info["modelName"] = (
-            scpd_xml.getElementsByTagName("modelName")[0].childNodes[0].data
-        )
-        discovery_info["modelNumber"] = (
-            scpd_xml.getElementsByTagName("modelNumber")[0].childNodes[0].data
-        )
-        # discovery_info["presentationURL"] = (
-        #     scpd_xml.getElementsByTagName("presentationURL")[0].childNodes[0].data
-        # )  ## bticino did not populate this field
-        discovery_info["serialNumber"] = (
-            scpd_xml.getElementsByTagName("serialNumber")[0].childNodes[0].data
-        )
-        discovery_info["UDN"] = (
-            scpd_xml.getElementsByTagName("UDN")[0].childNodes[0].data
-        )
+        for field in (
+            "deviceType",
+            "friendlyName",
+            "manufacturer",
+            "manufacturerURL",
+            "modelName",
+            "modelNumber",
+            # "presentationURL",  ## bticino did not populate this field
+            "serialNumber",
+            "UDN",
+        ):
+            discovery_info[field] = _node_text(scpd_xml, field)
 
         discovery_info["port"] = await get_port(scpd_location, session=http_session)
 

@@ -141,6 +141,8 @@ class OWNGateway:
 
     @classmethod
     async def build_from_discovery_info(cls, discovery_info: dict):
+        # Work on our own copy: never mutate the caller's dict.
+        discovery_info = dict(discovery_info)
         if (
             ("address" not in discovery_info or discovery_info["address"] is None)
             and "ssdp_location" in discovery_info
@@ -407,8 +409,9 @@ class OWNSession:
 
             retry_count += 1
             if retry_count >= MAX_CONNECT_ATTEMPTS:
-                self._logger.error(
-                    "%s %s session could not be established after %d attempts; giving up.",
+                self._logger.warning(
+                    "%s %s session could not be established after %d attempts; "
+                    "will retry.",
                     self._gateway.log_id,
                     self._type.capitalize(),
                     MAX_CONNECT_ATTEMPTS,
