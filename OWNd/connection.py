@@ -217,9 +217,10 @@ class OWNSession:
             try:
                 self._on_state_change(value)
             except Exception:  # noqa: BLE001 - consumer callback must not break us
-                self._logger.exception(
-                    "%s on_state_change callback raised.", self._gateway.log_id
-                )
+                if self._logger is not None:
+                    self._logger.exception(
+                        "%s on_state_change callback raised.", self._gateway.log_id
+                    )
 
     def _apply_tcp_keepalive(self) -> None:
         """Enable OS-level TCP keepalive on the current socket (best-effort).
