@@ -9,8 +9,8 @@ with open("README.md", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="OWNd",
-    version="1.0.1",
-    author="anotherjulien, fedem95",
+    version="1.0.2",
+    author="fedem95",
     url="https://github.com/fedem95/OWNd",
     author_email="tbd@gmail.com",
     description="Python interface for the OpenWebNet protocol",

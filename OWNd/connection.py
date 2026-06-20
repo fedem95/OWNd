@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import logging
 import secrets
+import socket
 import string
 from collections.abc import Callable
 from urllib.parse import urlparse
@@ -37,6 +38,15 @@ KEEPALIVE_INTERVAL = 900  # 15 minutes
 # during normal operation; it only catches a truly silent death (power loss,
 # cable pulled) when no clean FIN/RST is received.
 EVENT_INACTIVITY_TIMEOUT = 3900  # 65 minutes
+# OS-level TCP keepalive for the EVENT session socket. The kernel sends empty
+# probes on the *existing* connection (no new sessions, no gateway-side app
+# load) and surfaces a dead link as a socket error, which the read loop turns
+# into a reconnect. This actively detects a silent death (power loss, cable
+# pulled, blackholed route) in ~TCP_KEEPALIVE_IDLE + TCP_KEEPALIVE_CNT *
+# TCP_KEEPALIVE_INTVL seconds, instead of waiting for the passive watchdog.
+TCP_KEEPALIVE_IDLE = 30  # start probing after 30s of silence
+TCP_KEEPALIVE_INTVL = 10  # probe every 10s
+TCP_KEEPALIVE_CNT = 3  # declare dead after 3 missed probes (~60s total)
 # Negotiation failures that will never succeed on a retry: don't loop on them.
 _FATAL_NEGOTIATION_ERRORS = frozenset(
     {"password_required", "password_error", "negociation_error"}
@@ -184,6 +194,8 @@ class OWNSession:
         self._logger = logger
         self._on_state_change = on_state_change
         self._connected = False
+        # Enable OS-level TCP keepalive on the socket (event session only).
+        self._tcp_keepalive = False
 
         # Stream reader/writer, initialised on connect():
         self._stream_reader: asyncio.StreamReader | None = None
@@ -206,6 +218,48 @@ class OWNSession:
                 self._logger.exception(
                     "%s on_state_change callback raised.", self._gateway.log_id
                 )
+
+    def _apply_tcp_keepalive(self) -> None:
+        """Enable OS-level TCP keepalive on the current socket (best-effort).
+
+        Any failure (option unsupported, platform without the fine-grained
+        Linux knobs, no socket) is logged and ignored: the connection keeps
+        working exactly as before, so this can never break the link.
+        """
+        if not self._tcp_keepalive or self._stream_writer is None:
+            return
+        try:
+            sock = self._stream_writer.get_extra_info("socket")
+            if sock is None:
+                return
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Linux-specific fine tuning; absent on some platforms -> ignored.
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                sock.setsockopt(
+                    socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE
+                )
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                sock.setsockopt(
+                    socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTVL
+                )
+            if hasattr(socket, "TCP_KEEPCNT"):
+                sock.setsockopt(
+                    socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_CNT
+                )
+            self._logger.debug(
+                "%s TCP keepalive enabled on event socket "
+                "(idle=%ss, intvl=%ss, cnt=%s).",
+                self._gateway.log_id,
+                TCP_KEEPALIVE_IDLE,
+                TCP_KEEPALIVE_INTVL,
+                TCP_KEEPALIVE_CNT,
+            )
+        except OSError as err:
+            self._logger.warning(
+                "%s Could not enable TCP keepalive (%s); continuing without it.",
+                self._gateway.log_id,
+                err,
+            )
 
     async def _read_frame(self, timeout: float | None = None) -> str:  # noqa: ASYNC109
         """Read one OWN frame (terminated by SEPARATOR) and return it decoded.
@@ -321,6 +375,7 @@ class OWNSession:
                     asyncio.open_connection(self._gateway.address, self._gateway.port),
                     timeout=CONNECT_TIMEOUT,
                 )
+                self._apply_tcp_keepalive()
                 result = await self._negotiate()
                 if result.get("Success"):
                     self._set_connected(True)
@@ -731,6 +786,9 @@ class OWNEventSession(OWNSession):
         # Passive watchdog: reconnect if no frame arrives for this long.
         # Set to None to disable (pure blocking read, never times out).
         self._inactivity_timeout = inactivity_timeout
+        # The event session is the long-lived monitored connection: let the OS
+        # actively probe it so a silent outage is detected in ~60s.
+        self._tcp_keepalive = True
 
     @classmethod
     async def connect_to_gateway(cls, gateway: OWNGateway):
