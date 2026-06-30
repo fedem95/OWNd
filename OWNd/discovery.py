@@ -263,7 +263,7 @@ async def get_port(
 
         port = _node_text(soap_response, "Port")
         return int(port) if port is not None else DEFAULT_PORT
-    except (aiohttp.ClientError, ExpatError, IndexError, ValueError):
+    except (aiohttp.ClientError, ExpatError, IndexError, ValueError, TimeoutError, asyncio.TimeoutError):
         # Unreachable gateway, HTTP error page, malformed/missing XML, timeout:
         # fall back to the default port instead of crashing discovery.
         return DEFAULT_PORT
@@ -336,9 +336,12 @@ async def find_gateways(session: aiohttp.ClientSession | None = None) -> list[di
 
     while not recvq.empty():
         discovery_info = await recvq.get()
-        discovery_info.update(
-            await _get_scpd_details(discovery_info["ssdp_location"], session=session)
-        )
+        try:
+            discovery_info.update(
+                await _get_scpd_details(discovery_info["ssdp_location"], session=session)
+            )
+        except (aiohttp.ClientError, ExpatError, IndexError, ValueError, TimeoutError, asyncio.TimeoutError):
+            pass
 
         return_list.append(discovery_info)
 

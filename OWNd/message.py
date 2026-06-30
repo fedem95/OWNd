@@ -355,11 +355,13 @@ class OWNEvent(OWNMessage):
             if _who == 18:
                 return OWNEnergyEvent(data)
             if _who == 25:
-                _where = re.match(r"^\*.+\*(?P<where>\d+)##$", data).group("where")
-                if _where.startswith("2"):
-                    return OWNCENPlusEvent(data)
-                if _where.startswith("3"):
-                    return OWNDryContactEvent(data)
+                _where_match = re.match(r"^\*.+\*(?P<where>\d+)##$", data)
+                if _where_match:
+                    _where = _where_match.group("where")
+                    if _where.startswith("2"):
+                        return OWNCENPlusEvent(data)
+                    if _where.startswith("3"):
+                        return OWNDryContactEvent(data)
             elif _who > 1000:
                 return cls(data)
 
@@ -766,10 +768,12 @@ class OWNHeatingEvent(OWNEvent):
                 or self._dimension_value[0] == "8"
             ):
                 self._local_offset = 0
-            elif self._dimension_value[0].startswith("0"):
+            elif self._dimension_value[0].startswith("0") and len(self._dimension_value[0]) > 1:
                 self._local_offset = int(f"{self._dimension_value[0][1:]}")
-            else:
+            elif len(self._dimension_value[0]) > 1:
                 self._local_offset = -int(f"{self._dimension_value[0][1:]}")
+            else:
+                self._local_offset = 0
             self._human_readable_log = (
                 f"Zone {self._zone}'s local offset is set to {self._local_offset}°C."
             )
