@@ -546,7 +546,7 @@ class OWNSession:
 
         if self._gateway.password is not None and not (
             isinstance(self._gateway.password, str)
-            and self._gateway.password.isascii()
+            and self._gateway.password.isalnum()
         ):
             self._logger.error(
                 "%s Invalid OpenWebNet password: expected decimal digits only.",
